@@ -27,8 +27,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private System.Windows.Controls.Button		addOcoButton;
 		private System.Windows.Controls.Button		autoTargetToggleButton;
 		private System.Windows.Controls.Button		autoStopToggleButton;
-		private NinjaTrader.Gui.Tools.QuantityUpDown	targetInput;
-		private NinjaTrader.Gui.Tools.QuantityUpDown	stopInput;
+		private System.Windows.Controls.TextBox		targetInput;
+		private System.Windows.Controls.TextBox		stopInput;
 		private System.Windows.Controls.Grid		chartTraderGrid;
 		private NinjaTrader.Gui.Chart.ChartTrader	chartTraderControl;
 
@@ -132,50 +132,62 @@ namespace NinjaTrader.NinjaScript.Indicators
 			System.Windows.Controls.StackPanel buttonStack = new System.Windows.Controls.StackPanel { Orientation = System.Windows.Controls.Orientation.Vertical };
 
 			// --- Input Grid (Target & Stop) ---
-			System.Windows.Controls.Grid inputGrid = new System.Windows.Controls.Grid { Margin = new Thickness(0, 0, 0, 5) };
+			System.Windows.Controls.Grid inputGrid = new System.Windows.Controls.Grid { Margin = new Thickness(0, -15, 0, 5) };
 			inputGrid.ColumnDefinitions.Add(new ColumnDefinition());
 			inputGrid.ColumnDefinitions.Add(new ColumnDefinition());
 			inputGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 			inputGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
 			// Labels
-			var targetLabel = new TextBlock { Text = "Target", Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, FontSize = 11, FontWeight = FontWeights.Bold, Margin = new Thickness(0,0,0,0) };
-			var stopLabel = new TextBlock { Text = "Stop", Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, FontSize = 11, FontWeight = FontWeights.Bold, Margin = new Thickness(0,0,0,0) };
+			var targetLabel = new TextBlock { Text = "Target", Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, FontSize = 11, FontWeight = FontWeights.Bold };
+			var stopLabel = new TextBlock { Text = "Stop", Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, FontSize = 11, FontWeight = FontWeights.Bold };
 			System.Windows.Controls.Grid.SetRow(targetLabel, 0); System.Windows.Controls.Grid.SetColumn(targetLabel, 0);
 			System.Windows.Controls.Grid.SetRow(stopLabel, 0); System.Windows.Controls.Grid.SetColumn(stopLabel, 1);
 			inputGrid.Children.Add(targetLabel);
 			inputGrid.Children.Add(stopLabel);
 
-			// QuantityUpDowns
-			targetInput = new NinjaTrader.Gui.Tools.QuantityUpDown
+			// Target Input
+			targetInput = new System.Windows.Controls.TextBox
 			{
-				Value = (int)DollarTarget,
-				Minimum = 1,
-				Maximum = 100000,
+				Text = ((int)DollarTarget).ToString(),
 				Height = 22,
-				Margin = new Thickness(5, 0, 5, 2),
+				Margin = new Thickness(5, 2, 5, 2),
 				Background = new SolidColorBrush(Color.FromRgb(45, 45, 45)),
 				Foreground = Brushes.White,
 				BorderBrush = Brushes.Gray,
-				BorderThickness = new Thickness(1)
+				BorderThickness = new Thickness(1),
+				VerticalContentAlignment = VerticalAlignment.Center,
+				HorizontalContentAlignment = HorizontalAlignment.Center
 			};
-			targetInput.ValueChanged += OnTargetInputChanged;
+			targetInput.TextChanged += OnTargetInputChanged;
+			// Use AddHandler with handledEventsToo so we receive keys even if NinjaTrader marks them handled
+			targetInput.AddHandler(System.Windows.UIElement.PreviewKeyDownEvent,
+				new System.Windows.Input.KeyEventHandler(OnInputPreviewKeyDown), true);
+			targetInput.AddHandler(System.Windows.UIElement.KeyDownEvent,
+				new System.Windows.Input.KeyEventHandler((s, ev) => ev.Handled = true), true);
+			
 			System.Windows.Controls.Grid.SetRow(targetInput, 1); System.Windows.Controls.Grid.SetColumn(targetInput, 0);
 			inputGrid.Children.Add(targetInput);
 
-			stopInput = new NinjaTrader.Gui.Tools.QuantityUpDown
+			// Stop Input
+			stopInput = new System.Windows.Controls.TextBox
 			{
-				Value = (int)DollarStop,
-				Minimum = 1,
-				Maximum = 100000,
+				Text = ((int)DollarStop).ToString(),
 				Height = 22,
-				Margin = new Thickness(5, 0, 5, 2),
+				Margin = new Thickness(5, 2, 5, 2),
 				Background = new SolidColorBrush(Color.FromRgb(45, 45, 45)),
 				Foreground = Brushes.White,
 				BorderBrush = Brushes.Gray,
-				BorderThickness = new Thickness(1)
+				BorderThickness = new Thickness(1),
+				VerticalContentAlignment = VerticalAlignment.Center,
+				HorizontalContentAlignment = HorizontalAlignment.Center
 			};
-			stopInput.ValueChanged += OnStopInputChanged;
+			stopInput.TextChanged += OnStopInputChanged;
+			stopInput.AddHandler(System.Windows.UIElement.PreviewKeyDownEvent,
+				new System.Windows.Input.KeyEventHandler(OnInputPreviewKeyDown), true);
+			stopInput.AddHandler(System.Windows.UIElement.KeyDownEvent,
+				new System.Windows.Input.KeyEventHandler((s, ev) => ev.Handled = true), true);
+			
 			System.Windows.Controls.Grid.SetRow(stopInput, 1); System.Windows.Controls.Grid.SetColumn(stopInput, 1);
 			inputGrid.Children.Add(stopInput);
 
@@ -312,10 +324,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (addTargetButton != null) addTargetButton.Click -= OnAddTargetClicked;
 			if (addStopButton != null) addStopButton.Click -= OnAddStopClicked;
 			if (addOcoButton != null) addOcoButton.Click -= OnAddOcoClicked;
-			if (autoTargetToggleButton != null) autoTargetToggleButton.Click -= OnAutoTargetToggleClicked;
 			if (autoStopToggleButton != null) autoStopToggleButton.Click -= OnAutoStopToggleClicked;
-			if (targetInput != null) targetInput.ValueChanged -= OnTargetInputChanged;
-			if (stopInput != null) stopInput.ValueChanged -= OnStopInputChanged;
+			if (targetInput != null) 
+			{ 
+				targetInput.TextChanged -= OnTargetInputChanged; 
+				targetInput.PreviewKeyDown -= OnInputPreviewKeyDown;
+			}
+			if (stopInput != null) 
+			{ 
+				stopInput.TextChanged -= OnStopInputChanged; 
+				stopInput.PreviewKeyDown -= OnInputPreviewKeyDown;
+			}
 
 			// Find and remove the container (StackPanel or Grid) we added
 			foreach (var child in chartTraderGrid.Children.OfType<System.Windows.Controls.Panel>().ToList())
@@ -352,11 +371,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 						addStopButton.ToolTip = string.Format("Place a ${0} stop loss", DollarStop);
 					}
 					
-					if (targetInput != null && targetInput.Value != (int)DollarTarget)
-						targetInput.Value = (int)DollarTarget;
+					if (targetInput != null && targetInput.Text != ((int)DollarTarget).ToString())
+						targetInput.Text = ((int)DollarTarget).ToString();
 						
-					if (stopInput != null && stopInput.Value != (int)DollarStop)
-						stopInput.Value = (int)DollarStop;
+					if (stopInput != null && stopInput.Text != ((int)DollarStop).ToString())
+						stopInput.Text = ((int)DollarStop).ToString();
 
 					UpdateToggleButtonStyles();
 				}));
@@ -483,11 +502,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 
 		#region Order Execution
-		private void OnTargetInputChanged(object sender, EventArgs e)
+		private void OnTargetInputChanged(object sender, TextChangedEventArgs e)
 		{
-			if (targetInput != null)
+			if (targetInput != null && double.TryParse(targetInput.Text, out double val))
 			{
-				dollarTarget = targetInput.Value;
+				dollarTarget = val;
 				if (addTargetButton != null)
 				{
 					addTargetButton.Content = string.Format("Add Target (${0})", dollarTarget);
@@ -496,11 +515,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
-		private void OnStopInputChanged(object sender, EventArgs e)
+		private void OnStopInputChanged(object sender, TextChangedEventArgs e)
 		{
-			if (stopInput != null)
+			if (stopInput != null && double.TryParse(stopInput.Text, out double val))
 			{
-				dollarStop = stopInput.Value;
+				dollarStop = val;
 				if (addStopButton != null)
 				{
 					addStopButton.Content = string.Format("Add Stop (${0})", dollarStop);
@@ -509,6 +528,97 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
+		private void OnInputPreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+		{
+			var textBox = sender as System.Windows.Controls.TextBox;
+			if (textBox == null) return;
+
+			// Enter/Escape: commit and lose focus
+			if (e.Key == System.Windows.Input.Key.Enter || e.Key == System.Windows.Input.Key.Escape)
+			{
+				System.Windows.Input.Keyboard.ClearFocus();
+				e.Handled = true;
+				return;
+			}
+
+			// Allow navigation keys to pass through naturally
+			if (e.Key == System.Windows.Input.Key.Left || e.Key == System.Windows.Input.Key.Right
+				|| e.Key == System.Windows.Input.Key.Home || e.Key == System.Windows.Input.Key.End
+				|| e.Key == System.Windows.Input.Key.Tab)
+				return;
+
+			// Manually handle digit keys (0-9 and numpad)
+			string digit = null;
+			if (e.Key >= System.Windows.Input.Key.D0 && e.Key <= System.Windows.Input.Key.D9
+				&& (System.Windows.Input.Keyboard.Modifiers & System.Windows.Input.ModifierKeys.Shift) == 0)
+				digit = ((int)(e.Key - System.Windows.Input.Key.D0)).ToString();
+			else if (e.Key >= System.Windows.Input.Key.NumPad0 && e.Key <= System.Windows.Input.Key.NumPad9)
+				digit = ((int)(e.Key - System.Windows.Input.Key.NumPad0)).ToString();
+
+			if (digit != null)
+			{
+				int selStart = textBox.SelectionStart;
+				int selLen = textBox.SelectionLength;
+				string text = textBox.Text;
+				textBox.Text = text.Substring(0, selStart) + digit + text.Substring(selStart + selLen);
+				textBox.CaretIndex = selStart + 1;
+				e.Handled = true;
+				return;
+			}
+
+			// Handle Backspace
+			if (e.Key == System.Windows.Input.Key.Back)
+			{
+				if (textBox.SelectionLength > 0)
+				{
+					int selStart = textBox.SelectionStart;
+					textBox.Text = textBox.Text.Remove(selStart, textBox.SelectionLength);
+					textBox.CaretIndex = selStart;
+				}
+				else if (textBox.CaretIndex > 0)
+				{
+					int pos = textBox.CaretIndex;
+					textBox.Text = textBox.Text.Remove(pos - 1, 1);
+					textBox.CaretIndex = pos - 1;
+				}
+				e.Handled = true;
+				return;
+			}
+
+			// Handle Delete
+			if (e.Key == System.Windows.Input.Key.Delete)
+			{
+				if (textBox.SelectionLength > 0)
+				{
+					int selStart = textBox.SelectionStart;
+					textBox.Text = textBox.Text.Remove(selStart, textBox.SelectionLength);
+					textBox.CaretIndex = selStart;
+				}
+				else if (textBox.CaretIndex < textBox.Text.Length)
+				{
+					textBox.Text = textBox.Text.Remove(textBox.CaretIndex, 1);
+				}
+				e.Handled = true;
+				return;
+			}
+
+			// Handle Up/Down arrows to increment/decrement value
+			if (e.Key == System.Windows.Input.Key.Up || e.Key == System.Windows.Input.Key.Down)
+			{
+				if (double.TryParse(textBox.Text, out double currentVal))
+				{
+					currentVal += (e.Key == System.Windows.Input.Key.Up) ? 1 : -1;
+					if (currentVal < 1) currentVal = 1;
+					textBox.Text = ((int)currentVal).ToString();
+					textBox.CaretIndex = textBox.Text.Length;
+				}
+				e.Handled = true;
+				return;
+			}
+
+			// Block everything else (letters, etc.) so NinjaTrader can't intercept
+			e.Handled = true;
+		}
 
 		private void OnAutoTargetToggleClicked(object sender, RoutedEventArgs e)
 		{
