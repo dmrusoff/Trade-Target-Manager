@@ -132,15 +132,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 			System.Windows.Controls.StackPanel buttonStack = new System.Windows.Controls.StackPanel { Orientation = System.Windows.Controls.Orientation.Vertical };
 
 			// --- Input Grid (Target & Stop) ---
-			System.Windows.Controls.Grid inputGrid = new System.Windows.Controls.Grid { Margin = new Thickness(0, 5, 0, 5) };
+			System.Windows.Controls.Grid inputGrid = new System.Windows.Controls.Grid { Margin = new Thickness(0, 0, 0, 5) };
 			inputGrid.ColumnDefinitions.Add(new ColumnDefinition());
 			inputGrid.ColumnDefinitions.Add(new ColumnDefinition());
 			inputGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 			inputGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
 			// Labels
-			var targetLabel = new TextBlock { Text = "Target", Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, FontSize = 11, FontWeight = FontWeights.Bold };
-			var stopLabel = new TextBlock { Text = "Stop", Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, FontSize = 11, FontWeight = FontWeights.Bold };
+			var targetLabel = new TextBlock { Text = "Target", Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, FontSize = 11, FontWeight = FontWeights.Bold, Margin = new Thickness(0,0,0,0) };
+			var stopLabel = new TextBlock { Text = "Stop", Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, FontSize = 11, FontWeight = FontWeights.Bold, Margin = new Thickness(0,0,0,0) };
 			System.Windows.Controls.Grid.SetRow(targetLabel, 0); System.Windows.Controls.Grid.SetColumn(targetLabel, 0);
 			System.Windows.Controls.Grid.SetRow(stopLabel, 0); System.Windows.Controls.Grid.SetColumn(stopLabel, 1);
 			inputGrid.Children.Add(targetLabel);
@@ -153,7 +153,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				Minimum = 1,
 				Maximum = 100000,
 				Height = 22,
-				Margin = new Thickness(5, 2, 5, 2),
+				Margin = new Thickness(5, 0, 5, 2),
 				Background = new SolidColorBrush(Color.FromRgb(45, 45, 45)),
 				Foreground = Brushes.White,
 				BorderBrush = Brushes.Gray,
@@ -169,7 +169,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				Minimum = 1,
 				Maximum = 100000,
 				Height = 22,
-				Margin = new Thickness(5, 2, 5, 2),
+				Margin = new Thickness(5, 0, 5, 2),
 				Background = new SolidColorBrush(Color.FromRgb(45, 45, 45)),
 				Foreground = Brushes.White,
 				BorderBrush = Brushes.Gray,
