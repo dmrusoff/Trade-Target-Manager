@@ -46,7 +46,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private bool								isExecuting;
 		private double								lastPositionQuantity;
 		private MarketPosition						lastMarketPosition = MarketPosition.Flat;
-		private string								currentOcoId = string.Empty;
 		#endregion
 
 		protected override void OnStateChange()
@@ -476,23 +475,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 						Print(string.Format("TradeTargetManager: Auto-triggering for {0} position change ({1} @ {2})", 
 							e.Position.MarketPosition, e.Position.Quantity, e.Position.AveragePrice));
 							
-						// Generate a new OCO ID for this position state
-						currentOcoId = string.Format("TgtMgr_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
-						
-						if (AutoAddTarget) ExecuteAddTarget(e.Position, currentOcoId);
-						if (AutoAddStop) ExecuteAddStopLoss(e.Position, currentOcoId);
+						if (AutoAddTarget) ExecuteAddTarget(e.Position);
+						if (AutoAddStop) ExecuteAddStopLoss(e.Position);
 					}
 				}
 				else
 				{
-					// Position went flat - clean up all working orders
-					if (lastMarketPosition != MarketPosition.Flat)
-					{
-						Print("TradeTargetManager: Position went Flat. Cleaning up working orders.");
-						CancelExistingTarget();
-						CancelExistingStop();
-						currentOcoId = string.Empty;
-					}
+					// Position went flat - quantity tracking updated but orders left on chart as per user request
 				}
 
 				lastPositionQuantity = e.Position.Quantity;
@@ -651,11 +640,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 
 			// Generate a shared OCO ID
-			currentOcoId = string.Format("TgtMgr_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
+			string ocoId = string.Format("TgtMgr_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
 			
 			Print("TradeTargetManager: Adding manual OCO Target and Stop.");
-			ExecuteAddTarget(position, currentOcoId);
-			ExecuteAddStopLoss(position, currentOcoId);
+			ExecuteAddTarget(position, ocoId);
+			ExecuteAddStopLoss(position, ocoId);
 		}
 
 		private void ExecuteAddTarget(Position manualPos = null, string ocoId = null)
@@ -721,12 +710,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 				tradingAccount.OrderUpdate -= OnAccountOrderUpdate;
 				tradingAccount.OrderUpdate += OnAccountOrderUpdate;
 
-				// Use provided OCO ID or generate a new one
-				string finalOco = ocoId ?? currentOcoId;
+				// Use provided OCO ID or generate a new unique one
+				string finalOco = ocoId;
 				if (string.IsNullOrEmpty(finalOco))
-					finalOco = string.Format("TgtMgr_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
-				
-				currentOcoId = finalOco;
+					finalOco = string.Format("TgtMgr_Tgt_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
 
 				Order targetOrder = tradingAccount.CreateOrder(
 					Instrument, exitAction, OrderType.Limit, OrderEntry.Manual, TimeInForce.Gtc, quantity,
@@ -806,12 +793,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 				tradingAccount.OrderUpdate -= OnAccountOrderUpdate;
 				tradingAccount.OrderUpdate += OnAccountOrderUpdate;
 
-				// Use provided OCO ID or generate a new one
-				string finalOco = ocoId ?? currentOcoId;
+				// Use provided OCO ID or generate a new unique one
+				string finalOco = ocoId;
 				if (string.IsNullOrEmpty(finalOco))
-					finalOco = string.Format("TgtMgr_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
-
-				currentOcoId = finalOco;
+					finalOco = string.Format("TgtMgr_Stop_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
 
 				Order stopOrder = tradingAccount.CreateOrder(
 					Instrument, exitAction, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Gtc, quantity,
