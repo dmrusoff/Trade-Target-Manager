@@ -42,10 +42,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private double								dollarTarget = 36;
 		private double								dollarStop = 100;
 		private bool								autoAddTarget = true;
-		private bool								autoAddStop = true;
+		private bool								autoAddStop = false;
 		private bool								isExecuting;
 		private double								lastPositionQuantity;
 		private MarketPosition						lastMarketPosition = MarketPosition.Flat;
+		private volatile bool						lastFillWasMarketEntry;
+		private DateTime							lastUiCheck = DateTime.MinValue;
 		#endregion
 
 		protected override void OnStateChange()
@@ -64,7 +66,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				ShowStopButton	= true;
 				ShowAddOcoButton = true;
 				AutoAddTarget = true;
-				AutoAddStop = true;
+				AutoAddStop = false;
 			}
 			else if (State == State.Historical)
 			{
@@ -81,7 +83,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 				lock (Account.All)
 				{
 					foreach (Account acct in Account.All)
+					{
 						acct.PositionUpdate += OnPositionUpdate;
+						acct.ExecutionUpdate += OnExecutionUpdate;
+					}
 				}
 			}
 			else if (State == State.Terminated)
@@ -97,7 +102,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 				lock (Account.All)
 				{
 					foreach (Account acct in Account.All)
+					{
 						acct.PositionUpdate -= OnPositionUpdate;
+						acct.ExecutionUpdate -= OnExecutionUpdate;
+					}
 				}
 
 				if (tradingAccount != null)
@@ -110,7 +118,18 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		protected override void OnBarUpdate()
 		{
-			// No bar-level logic needed; this indicator is purely UI-driven.
+			if (State != State.Realtime) return;
+
+			// Periodically ensure UI and Account are synced
+			if ((DateTime.Now - lastUiCheck).TotalSeconds > 5)
+			{
+				lastUiCheck = DateTime.Now;
+				ChartControl.Dispatcher.InvokeAsync(new Action(() =>
+				{
+					if (!isButtonAdded) AddButtonToChartTrader();
+					tradingAccount = GetSelectedAccount();
+				}));
+			}
 		}
 
 		#region Chart Trader Button
@@ -123,15 +142,33 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			if (chartTraderGrid == null)
 			{
-				Print("TradeTargetManager: Could not locate Chart Trader panel.");
+				// Only print once in a while to avoid spamming
+				if (State == State.Realtime && CurrentBar % 100 == 0)
+					Print("TradeTargetManager: Chart Trader not found. Please ensure Chart Trader is visible.");
 				return;
 			}
 
 			// Create a container for our buttons to keep them together
-			System.Windows.Controls.StackPanel buttonStack = new System.Windows.Controls.StackPanel { Orientation = System.Windows.Controls.Orientation.Vertical };
+			System.Windows.Controls.StackPanel buttonStack = new System.Windows.Controls.StackPanel { 
+				Orientation = System.Windows.Controls.Orientation.Vertical,
+				Margin = new Thickness(5, 10, 5, 10) // Give the whole container some breathing room
+			};
+
+			// --- Header ---
+			var header = new TextBlock { 
+				Text = "TARGET MANAGER", 
+				Foreground = Brushes.Gold, 
+				HorizontalAlignment = HorizontalAlignment.Center, 
+				FontSize = 11, 
+				FontWeight = FontWeights.Bold,
+				Margin = new Thickness(0, 0, 0, 10) // Space below header
+			};
+			buttonStack.Children.Add(header);
 
 			// --- Input Grid (Target & Stop) ---
-			System.Windows.Controls.Grid inputGrid = new System.Windows.Controls.Grid { Margin = new Thickness(0, -15, 0, 5) };
+			System.Windows.Controls.Grid inputGrid = new System.Windows.Controls.Grid { 
+				Margin = new Thickness(0, 0, 0, 10) // Space below the grid
+			};
 			inputGrid.ColumnDefinitions.Add(new ColumnDefinition());
 			inputGrid.ColumnDefinitions.Add(new ColumnDefinition());
 			inputGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -304,10 +341,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 			buttonStack.Children.Add(autoStopToggleButton);
 			
 			UpdateToggleButtonStyles();
-			// Add a new row to the Chart Trader grid for our container
-			chartTraderGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-			int newRow = chartTraderGrid.RowDefinitions.Count - 1;
-			System.Windows.Controls.Grid.SetRow(buttonStack, newRow);
+			
+			// Add to Chart Trader in the middle (Row 8 is typically a good spot)
+			int targetRow = 8;
+			// Ensure we have enough row definitions
+			while (chartTraderGrid.RowDefinitions.Count <= targetRow)
+				chartTraderGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+			
+			System.Windows.Controls.Grid.SetRow(buttonStack, targetRow);
 			System.Windows.Controls.Grid.SetColumnSpan(buttonStack, chartTraderGrid.ColumnDefinitions.Count > 0 ? chartTraderGrid.ColumnDefinitions.Count : 1);
 			chartTraderGrid.Children.Add(buttonStack);
 
@@ -335,14 +376,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 				stopInput.PreviewKeyDown -= OnInputPreviewKeyDown;
 			}
 
-			// Find and remove the container (StackPanel or Grid) we added
-			foreach (var child in chartTraderGrid.Children.OfType<System.Windows.Controls.Panel>().ToList())
+			// Find and remove the container by looking for the header text
+			foreach (var child in chartTraderGrid.Children.OfType<System.Windows.Controls.StackPanel>().ToList())
 			{
-				if ((addTargetButton != null && child.Children.Contains(addTargetButton)) 
-					|| (addStopButton != null && child.Children.Contains(addStopButton))
-					|| (addOcoButton != null && child.Children.Contains(addOcoButton))
-					|| (autoTargetToggleButton != null && child.Children.Contains(autoTargetToggleButton))
-					|| (autoStopToggleButton != null && child.Children.Contains(autoStopToggleButton)))
+				if (child.Children.OfType<TextBlock>().Any(tb => tb.Text == "TARGET MANAGER"))
 				{
 					chartTraderGrid.Children.Remove(child);
 					break;
@@ -450,43 +487,71 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (e.Position.Instrument.FullName != Instrument.FullName)
 				return;
 			
-			// We must run UI logic on the Dispatcher thread
+			// Capture the properties immediately because e.Position is recycled by NT8
+			double currentQty = e.Position.Quantity;
+			MarketPosition currentMarketPos = e.Position.MarketPosition;
+			string acctName = e.Position.Account.Name;
+
+			// Run tracking and triggering logic
 			ChartControl.Dispatcher.InvokeAsync(new Action(() =>
 			{
-				// Only react if the account matches the one selected in Chart Trader
-				Account selectedAcct = GetSelectedAccount();
-				
-				// Debug log to help identify why it might be skipping
-				// Print(string.Format("TgtMgr: Position update for {0} on {1}. Selected: {2}", e.Position.Instrument.Symbol, e.Position.Account.Name, selectedAcct?.Name ?? "None"));
+				if (!AutoAddTarget) return;
 
-				if (selectedAcct == null || e.Position.Account.Name != selectedAcct.Name)
+				Account selectedAcct = GetSelectedAccount();
+				if (selectedAcct == null || acctName != selectedAcct.Name)
 					return;
 
 				tradingAccount = selectedAcct;
 
-				// Trigger if quantity changed OR if the direction reversed (e.g. Long 1 to Short 1)
-				bool isChanged = (e.Position.Quantity != lastPositionQuantity || e.Position.MarketPosition != lastMarketPosition);
-				bool isNotFlat = e.Position.MarketPosition != MarketPosition.Flat;
+				bool isChanged = (currentQty != lastPositionQuantity || currentMarketPos != lastMarketPosition);
+				bool isNotFlat = currentMarketPos != MarketPosition.Flat;
+				bool isIncrease = currentQty > lastPositionQuantity || (lastMarketPosition == MarketPosition.Flat && isNotFlat);
 
-				if (isNotFlat)
+				if (isNotFlat && isChanged && isIncrease)
 				{
-					if (isChanged)
+					Print(string.Format("TradeTargetManager: Position size increased ({0} -> {1}). Waiting 250ms for settlement...", 
+						lastPositionQuantity, currentQty));
+					
+					// Update tracking state immediately to prevent double-triggering
+					lastPositionQuantity = currentQty;
+					lastMarketPosition = currentMarketPos;
+
+					// Perform the delay in a background task, then dispatch the order placement to the UI thread
+					System.Threading.Tasks.Task.Run(async () =>
 					{
-						Print(string.Format("TradeTargetManager: Auto-triggering for {0} position change ({1} @ {2})", 
-							e.Position.MarketPosition, e.Position.Quantity, e.Position.AveragePrice));
-							
-						if (AutoAddTarget) ExecuteAddTarget(e.Position);
-						if (AutoAddStop) ExecuteAddStopLoss(e.Position);
-					}
+						await System.Threading.Tasks.Task.Delay(250);
+
+						ChartControl.Dispatcher.InvokeAsync(new Action(() =>
+						{
+							if (tradingAccount == null) return;
+							Position currentPos = tradingAccount.Positions.FirstOrDefault(p => p.Instrument.FullName == Instrument.FullName);
+							if (currentPos != null && currentPos.MarketPosition != MarketPosition.Flat)
+							{
+								Print(string.Format("TradeTargetManager: Submitting target order for {0} contracts.", currentPos.Quantity));
+								ExecuteAddTarget(currentPos);
+							}
+						}));
+					});
+				}
+				else if (isNotFlat && isChanged && !isIncrease)
+				{
+					Print(string.Format("TradeTargetManager: Position size decreased ({0} -> {1}). Ignoring reduction.", 
+						lastPositionQuantity, currentQty));
+					
+					lastPositionQuantity = currentQty;
+					lastMarketPosition = currentMarketPos;
 				}
 				else
 				{
-					// Position went flat - quantity tracking updated but orders left on chart as per user request
+					lastPositionQuantity = currentQty;
+					lastMarketPosition = currentMarketPos;
 				}
-
-				lastPositionQuantity = e.Position.Quantity;
-				lastMarketPosition = e.Position.MarketPosition;
 			}));
+		}
+
+		private void OnExecutionUpdate(object sender, ExecutionEventArgs e)
+		{
+			// Not used in this simplified target model
 		}
 
 
@@ -625,26 +690,92 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		private void OnAddTargetClicked(object sender, RoutedEventArgs e) { ExecuteAddTarget(); }
 		private void OnAddStopClicked(object sender, RoutedEventArgs e) { ExecuteAddStopLoss(); }
-		private void OnAddOcoClicked(object sender, RoutedEventArgs e)
+		private void OnAddOcoClicked(object sender, RoutedEventArgs e) { ExecuteUpdateOrders(GetSelectedPosition()); }
+		private Position GetSelectedPosition()
 		{
-			if (isExecuting) return;
-			
 			tradingAccount = GetSelectedAccount();
-			if (tradingAccount == null) return;
+			if (tradingAccount == null) return null;
+			return tradingAccount.Positions.FirstOrDefault(p => p.Instrument.FullName == Instrument.FullName);
+		}
 
-			Position position = tradingAccount.Positions.FirstOrDefault(p => p.Instrument.FullName == Instrument.FullName);
+		private void ExecuteUpdateOrders(Position position)
+		{
+			if (isExecuting || tradingAccount == null) return;
 			if (position == null || position.MarketPosition == MarketPosition.Flat)
 			{
-				Print("TradeTargetManager: No open position to add OCO to.");
+				Print("TradeTargetManager: No open position to update.");
 				return;
 			}
 
-			// Generate a shared OCO ID
-			string ocoId = string.Format("TgtMgr_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
-			
-			Print("TradeTargetManager: Adding manual OCO Target and Stop.");
-			ExecuteAddTarget(position, ocoId);
-			ExecuteAddStopLoss(position, ocoId);
+			isExecuting = true;
+
+			try
+			{
+				double entryPrice = position.AveragePrice;
+				int quantity = (int)position.Quantity;
+				MarketPosition direction = position.MarketPosition;
+
+				double tickSize = Instrument.MasterInstrument.TickSize;
+				double pointValue = Instrument.MasterInstrument.PointValue;
+				double tickValue = tickSize * pointValue;
+
+				// Calculate Target Offset
+				double targetTicks = DollarTarget / (tickValue * quantity);
+				double targetOffset = Math.Round(targetTicks) * tickSize;
+				double targetPrice = direction == MarketPosition.Long ? entryPrice + targetOffset : entryPrice - targetOffset;
+				targetPrice = Instrument.MasterInstrument.RoundToTickSize(targetPrice);
+
+				// Calculate Stop Offset
+				double stopTicks = DollarStop / (tickValue * quantity);
+				double stopOffset = Math.Round(stopTicks) * tickSize;
+				double stopPrice = direction == MarketPosition.Long ? entryPrice - stopOffset : entryPrice + stopOffset;
+				stopPrice = Instrument.MasterInstrument.RoundToTickSize(stopPrice);
+
+				OrderAction exitAction = direction == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
+
+				// Cancel existing
+				CancelExistingOrders();
+
+				// Submit new ones as OCO
+				string ocoId = string.Format("TgtMgr_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
+
+				Order targetOrder = tradingAccount.CreateOrder(
+					Instrument, exitAction, OrderType.Limit, OrderEntry.Manual, TimeInForce.Gtc, quantity,
+					targetPrice, 0, ocoId, "TgtMgr_Target", Core.Globals.MaxDate, null
+				);
+
+				Order stopOrder = tradingAccount.CreateOrder(
+					Instrument, exitAction, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Gtc, quantity,
+					0, stopPrice, ocoId, "TgtMgr_Stop", Core.Globals.MaxDate, null
+				);
+
+				tradingAccount.Submit(new[] { targetOrder, stopOrder });
+				
+				activeTargetOrder = targetOrder;
+				activeTargetOrderId = targetOrder.OrderId;
+				activeStopOrder = stopOrder;
+				activeStopOrderId = stopOrder.OrderId;
+
+				Print(string.Format("TradeTargetManager: Updated Orders -> Target: {0}, Stop: {1} (Qty: {2}, OCO: {3})", 
+					targetPrice, stopPrice, quantity, ocoId));
+			}
+			catch (Exception ex) { Print("TradeTargetManager ERROR: " + ex.Message); }
+			finally { isExecuting = false; }
+		}
+
+		private void CancelExistingOrders()
+		{
+			if (tradingAccount == null) return;
+			var workingOrders = tradingAccount.Orders.Where(o => 
+				o.Instrument == Instrument && (o.Name == "TgtMgr_Target" || o.Name == "TgtMgr_Stop") &&
+				(o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted)
+			).ToList();
+
+			if (workingOrders.Count > 0) tradingAccount.Cancel(workingOrders);
+			activeTargetOrderId = null;
+			activeStopOrderId = null;
+			activeTargetOrder = null;
+			activeStopOrder = null;
 		}
 
 		private void ExecuteAddTarget(Position manualPos = null, string ocoId = null)
