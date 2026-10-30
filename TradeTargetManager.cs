@@ -46,6 +46,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private bool								isExecuting;
 		private double								lastPositionQuantity;
 		private MarketPosition						lastMarketPosition = MarketPosition.Flat;
+		private readonly Dictionary<string, double> accountLastQuantities = new Dictionary<string, double>();
+		private readonly Dictionary<string, MarketPosition> accountLastPositions = new Dictionary<string, MarketPosition>();
+		private readonly object stateLock = new object();
 		private volatile bool						lastFillWasMarketEntry;
 		private DateTime							lastUiCheck = DateTime.MinValue;
 		#endregion
@@ -495,7 +498,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			// Run tracking and triggering logic
 			ChartControl.Dispatcher.InvokeAsync(new Action(() =>
 			{
-				if (!AutoAddTarget) return;
+				if (!AutoAddTarget && !AutoAddStop) return;
 
 				Account selectedAcct = GetSelectedAccount();
 				if (selectedAcct == null || acctName != selectedAcct.Name)
@@ -503,23 +506,38 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				tradingAccount = selectedAcct;
 
-				bool isChanged = (currentQty != lastPositionQuantity || currentMarketPos != lastMarketPosition);
+				double lastQty = 0;
+				MarketPosition lastPos = MarketPosition.Flat;
+				lock (stateLock)
+				{
+					if (accountLastQuantities.ContainsKey(acctName))
+						lastQty = accountLastQuantities[acctName];
+					if (accountLastPositions.ContainsKey(acctName))
+						lastPos = accountLastPositions[acctName];
+				}
+
+				bool isChanged = (currentQty != lastQty || currentMarketPos != lastPos);
 				bool isNotFlat = currentMarketPos != MarketPosition.Flat;
-				bool isIncrease = currentQty > lastPositionQuantity || (lastMarketPosition == MarketPosition.Flat && isNotFlat);
+				bool isIncrease = currentQty > lastQty || (lastPos == MarketPosition.Flat && isNotFlat);
 
 				if (isNotFlat && isChanged && isIncrease)
 				{
-					Print(string.Format("TradeTargetManager: Position size increased ({0} -> {1}). Waiting 250ms for settlement...", 
-						lastPositionQuantity, currentQty));
+					Print(string.Format("TradeTargetManager: Position size increased on {2} ({0} -> {1}). Waiting 1s for settlement...", 
+						lastQty, currentQty, acctName));
 					
 					// Update tracking state immediately to prevent double-triggering
+					lock (stateLock)
+					{
+						accountLastQuantities[acctName] = currentQty;
+						accountLastPositions[acctName] = currentMarketPos;
+					}
 					lastPositionQuantity = currentQty;
 					lastMarketPosition = currentMarketPos;
 
 					// Perform the delay in a background task, then dispatch the order placement to the UI thread
 					System.Threading.Tasks.Task.Run(async () =>
 					{
-						await System.Threading.Tasks.Task.Delay(250);
+						await System.Threading.Tasks.Task.Delay(1000);
 
 						ChartControl.Dispatcher.InvokeAsync(new Action(() =>
 						{
@@ -527,22 +545,85 @@ namespace NinjaTrader.NinjaScript.Indicators
 							Position currentPos = tradingAccount.Positions.FirstOrDefault(p => p.Instrument.FullName == Instrument.FullName);
 							if (currentPos != null && currentPos.MarketPosition != MarketPosition.Flat)
 							{
-								Print(string.Format("TradeTargetManager: Submitting target order for {0} contracts.", currentPos.Quantity));
-								ExecuteAddTarget(currentPos);
+								if (AutoAddTarget && AutoAddStop)
+								{
+									Print(string.Format("TradeTargetManager: Submitting target and stop OCO orders for {0} contracts on {1}.", currentPos.Quantity, tradingAccount.Name));
+									ExecuteUpdateOrders(currentPos);
+								}
+								else if (AutoAddTarget)
+								{
+									Print(string.Format("TradeTargetManager: Submitting target order for {0} contracts on {1}.", currentPos.Quantity, tradingAccount.Name));
+									ExecuteAddTarget(currentPos);
+								}
+								else if (AutoAddStop)
+								{
+									Print(string.Format("TradeTargetManager: Submitting stop order for {0} contracts on {1}.", currentPos.Quantity, tradingAccount.Name));
+									ExecuteAddStopLoss(currentPos);
+								}
+							}
+						}));
+
+						// Wait another 1000ms for a second check (2s total)
+						await System.Threading.Tasks.Task.Delay(1000);
+
+						ChartControl.Dispatcher.InvokeAsync(new Action(() =>
+						{
+							if (tradingAccount == null) return;
+							Position currentPos = tradingAccount.Positions.FirstOrDefault(p => p.Instrument.FullName == Instrument.FullName);
+							if (currentPos != null && currentPos.MarketPosition != MarketPosition.Flat)
+							{
+								bool hasTarget = tradingAccount.Orders.Any(o => o.Instrument == Instrument && o.Name == "TgtMgr_Target" && 
+									(o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
+								bool hasStop = tradingAccount.Orders.Any(o => o.Instrument == Instrument && o.Name == "TgtMgr_Stop" && 
+									(o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
+
+								bool targetNeeded = AutoAddTarget && !hasTarget;
+								bool stopNeeded = AutoAddStop && !hasStop;
+
+								if (targetNeeded || stopNeeded)
+								{
+									Print(string.Format("TradeTargetManager (2s Double-Check): Missing expected orders (Target Needed: {0}, Stop Needed: {1}). Re-submitting...", targetNeeded, stopNeeded));
+									if (AutoAddTarget && AutoAddStop)
+									{
+										ExecuteUpdateOrders(currentPos);
+									}
+									else if (AutoAddTarget)
+									{
+										ExecuteAddTarget(currentPos);
+									}
+									else if (AutoAddStop)
+									{
+										ExecuteAddStopLoss(currentPos);
+									}
+								}
+								else
+								{
+									Print("TradeTargetManager (2s Double-Check): All expected orders are active.");
+								}
 							}
 						}));
 					});
 				}
 				else if (isNotFlat && isChanged && !isIncrease)
 				{
-					Print(string.Format("TradeTargetManager: Position size decreased ({0} -> {1}). Ignoring reduction.", 
-						lastPositionQuantity, currentQty));
+					Print(string.Format("TradeTargetManager: Position size decreased on {2} ({0} -> {1}). Ignoring reduction.", 
+						lastQty, currentQty, acctName));
 					
+					lock (stateLock)
+					{
+						accountLastQuantities[acctName] = currentQty;
+						accountLastPositions[acctName] = currentMarketPos;
+					}
 					lastPositionQuantity = currentQty;
 					lastMarketPosition = currentMarketPos;
 				}
 				else
 				{
+					lock (stateLock)
+					{
+						accountLastQuantities[acctName] = currentQty;
+						accountLastPositions[acctName] = currentMarketPos;
+					}
 					lastPositionQuantity = currentQty;
 					lastMarketPosition = currentMarketPos;
 				}
@@ -755,6 +836,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 				activeTargetOrderId = targetOrder.OrderId;
 				activeStopOrder = stopOrder;
 				activeStopOrderId = stopOrder.OrderId;
+				lock (stateLock)
+				{
+					accountLastQuantities[tradingAccount.Name] = quantity;
+					accountLastPositions[tradingAccount.Name] = direction;
+				}
+				lastPositionQuantity = quantity;
+				lastMarketPosition = direction;
 
 				Print(string.Format("TradeTargetManager: Updated Orders -> Target: {0}, Stop: {1} (Qty: {2}, OCO: {3})", 
 					targetPrice, stopPrice, quantity, ocoId));
@@ -854,6 +942,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 				tradingAccount.Submit(new[] { targetOrder });
 				activeTargetOrder	= targetOrder;
 				activeTargetOrderId	= targetOrder.OrderId;
+				lock (stateLock)
+				{
+					accountLastQuantities[tradingAccount.Name] = quantity;
+					accountLastPositions[tradingAccount.Name] = direction;
+				}
 				lastPositionQuantity = quantity;
 				lastMarketPosition = direction;
 
@@ -937,6 +1030,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 				tradingAccount.Submit(new[] { stopOrder });
 				activeStopOrder		= stopOrder;
 				activeStopOrderId	= stopOrder.OrderId;
+				lock (stateLock)
+				{
+					accountLastQuantities[tradingAccount.Name] = quantity;
+					accountLastPositions[tradingAccount.Name] = direction;
+				}
 				lastPositionQuantity = quantity;
 				lastMarketPosition = direction;
 
