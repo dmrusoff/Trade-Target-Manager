@@ -14,6 +14,7 @@ using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
 
 namespace NinjaTrader.NinjaScript.Indicators
@@ -24,9 +25,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 		// UI Elements
 		private System.Windows.Controls.Button		addTargetButton;
 		private System.Windows.Controls.Button		addStopButton;
-		private System.Windows.Controls.Button		addOcoButton;
+		private System.Windows.Controls.Button		updateOcoButton;
 		private System.Windows.Controls.Button		autoTargetToggleButton;
 		private System.Windows.Controls.Button		autoStopToggleButton;
+		private System.Windows.Controls.Button		stealthToggleButton;
 		private System.Windows.Controls.TextBox		targetInput;
 		private System.Windows.Controls.TextBox		stopInput;
 		private System.Windows.Controls.Grid		chartTraderGrid;
@@ -43,6 +45,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private double								dollarStop = 100;
 		private bool								autoAddTarget = true;
 		private bool								autoAddStop = false;
+		private bool								stealthMode = true;
+		private double								stealthTargetPrice;
+		private double								stealthStopPrice;
+		private volatile bool						stealthExitPending;
 		private bool								isExecuting;
 		private double								lastPositionQuantity;
 		private MarketPosition						lastMarketPosition = MarketPosition.Flat;
@@ -51,25 +57,72 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private readonly object stateLock = new object();
 		private volatile bool						lastFillWasMarketEntry;
 		private DateTime							lastUiCheck = DateTime.MinValue;
+
+		public class AccountTradeState
+		{
+			public string AccountName;
+			public double LastPositionQuantity;
+			public MarketPosition LastMarketPosition = MarketPosition.Flat;
+			public double StealthTargetPrice;
+			public double StealthStopPrice;
+			public string ActiveTargetOrderId;
+			public string ActiveStopOrderId;
+		}
+
+		private readonly Dictionary<string, AccountTradeState> accountStates = new Dictionary<string, AccountTradeState>();
+		private string lastAccountName;
+
+		private AccountTradeState GetAccountState(string accountName)
+		{
+			if (string.IsNullOrEmpty(accountName)) return null;
+			if (!accountStates.TryGetValue(accountName, out AccountTradeState state))
+			{
+				state = new AccountTradeState { AccountName = accountName };
+				accountStates[accountName] = state;
+			}
+			return state;
+		}
+
+		private void SaveActiveAccountState()
+		{
+			if (string.IsNullOrEmpty(lastAccountName)) return;
+			AccountTradeState activeState = GetAccountState(lastAccountName);
+			activeState.LastPositionQuantity = lastPositionQuantity;
+			activeState.LastMarketPosition = lastMarketPosition;
+			activeState.StealthTargetPrice = stealthTargetPrice;
+			activeState.StealthStopPrice = stealthStopPrice;
+			activeState.ActiveTargetOrderId = activeTargetOrderId;
+			activeState.ActiveStopOrderId = activeStopOrderId;
+		}
 		#endregion
 
 		protected override void OnStateChange()
 		{
 			if (State == State.SetDefaults)
 			{
-				Description		= "Adds 'Add Target' and 'Add Stop' buttons to the Chart Trader panel.";
+				Description		= "Adds 'Add Target' and 'Add Stop' buttons to the Chart Trader panel with Stealth Orders mode.";
 				Name			= "TradeTargetManager";
-				Calculate		= Calculate.OnBarClose;
+				Calculate		= Calculate.OnEachTick;
 				IsOverlay		= true;
 				DisplayInDataBox	= false;
-				IsSuspendedWhileInactive = true;
+				// Must keep processing when the chart is not the active/visible tab,
+				// otherwise stealth stop/target monitoring silently pauses.
+				IsSuspendedWhileInactive = false;
 				DollarTarget	= 36;
 				DollarStop		= 100;
 				ShowTargetButton = true;
 				ShowStopButton	= true;
-				ShowAddOcoButton = true;
+				ShowUpdateOcoButton = true;
+				ShowStealthButton = true;
 				AutoAddTarget = true;
 				AutoAddStop = false;
+				StealthMode = true;
+			}
+			else if (State == State.Configure)
+			{
+				// Calculate is persisted per indicator instance / workspace. Force tick-level
+				// processing so stealth levels are evaluated intrabar, not only at bar close.
+				Calculate = Calculate.OnEachTick;
 			}
 			else if (State == State.Historical)
 			{
@@ -116,6 +169,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 					tradingAccount.OrderUpdate -= OnAccountOrderUpdate;
 					tradingAccount = null;
 				}
+
+				RemoveDrawObject("StealthTarget");
+				RemoveDrawObject("StealthStop");
+				RemoveDrawObject("StealthEntry");
 			}
 		}
 
@@ -124,15 +181,134 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (State != State.Realtime) return;
 
 			// Periodically ensure UI and Account are synced
-			if ((DateTime.Now - lastUiCheck).TotalSeconds > 5)
+			if (ChartControl != null && (DateTime.Now - lastUiCheck).TotalSeconds > 5)
 			{
 				lastUiCheck = DateTime.Now;
 				ChartControl.Dispatcher.InvokeAsync(new Action(() =>
 				{
 					if (!isButtonAdded) AddButtonToChartTrader();
-					tradingAccount = GetSelectedAccount();
+					Account newAcct = GetSelectedAccount();
+					if (newAcct != null && newAcct.Name != lastAccountName)
+						SwitchActiveAccount(newAcct);
+					if (newAcct != null)
+						tradingAccount = newAcct;
 				}));
 			}
+
+			CheckStealthLevels(Close[0]);
+		}
+
+		protected override void OnMarketData(MarketDataEventArgs e)
+		{
+			// Evaluate stealth levels on every trade print, independent of bar processing
+			if (State != State.Realtime || e.MarketDataType != MarketDataType.Last) return;
+			CheckStealthLevels(e.Price);
+		}
+
+		/// <summary>
+		/// Monitors stealth target/stop levels against the latest traded price and flattens when hit.
+		/// </summary>
+		private void CheckStealthLevels(double price)
+		{
+			if (price <= 0) return;
+
+			// Account not resolved yet - do NOT treat as flat (that would wipe the stealth levels)
+			if (tradingAccount == null) return;
+
+			Position position = GetPosition();
+			bool isFlat = position == null || position.MarketPosition == MarketPosition.Flat || position.Quantity == 0;
+
+			if (isFlat)
+			{
+				stealthExitPending = false;
+				if (stealthTargetPrice > 0 || stealthStopPrice > 0)
+				{
+					stealthTargetPrice = 0;
+					stealthStopPrice = 0;
+					RemoveStealthLines();
+					SaveActiveAccountState();
+				}
+				return;
+			}
+
+			if (!stealthMode)
+			{
+				RemoveStealthLines();
+				return;
+			}
+
+			// A flatten has already been sent; wait for the position to go flat
+			if (stealthExitPending) return;
+
+			bool hit = false;
+			string hitType = "";
+			double tgt = stealthTargetPrice;
+			double stp = stealthStopPrice;
+
+			if (position.MarketPosition == MarketPosition.Long)
+			{
+				if (tgt > 0 && price >= tgt) { hit = true; hitType = "Target"; }
+				else if (stp > 0 && price <= stp) { hit = true; hitType = "Stop"; }
+			}
+			else if (position.MarketPosition == MarketPosition.Short)
+			{
+				if (tgt > 0 && price <= tgt) { hit = true; hitType = "Target"; }
+				else if (stp > 0 && price >= stp) { hit = true; hitType = "Stop"; }
+			}
+
+			if (hit)
+			{
+				stealthExitPending = true;
+				Print(string.Format("TradeTargetManager: Stealth {0} hit @ {1} (Threshold: {2}). Flattening {3} {4} on {5}.", 
+					hitType, price, hitType == "Target" ? tgt : stp, position.MarketPosition, position.Quantity, tradingAccount.Name));
+
+				stealthTargetPrice = 0;
+				stealthStopPrice = 0;
+				RemoveStealthLines();
+				SaveActiveAccountState();
+
+				try
+				{
+					tradingAccount.Flatten(new[] { Instrument });
+				}
+				catch (Exception ex)
+				{
+					stealthExitPending = false;
+					Print("TradeTargetManager: Stealth FLATTEN ERROR: " + ex.Message);
+				}
+				return;
+			}
+
+			// Draw Stealth Levels
+			try
+			{
+				if (tgt > 0)
+					Draw.HorizontalLine(this, "StealthTarget", tgt, Brushes.LimeGreen, DashStyleHelper.Dash, 2);
+				else
+					RemoveDrawObject("StealthTarget");
+
+				if (stp > 0)
+					Draw.HorizontalLine(this, "StealthStop", stp, Brushes.Firebrick, DashStyleHelper.Dash, 2);
+				else
+					RemoveDrawObject("StealthStop");
+
+				if (tgt > 0 || stp > 0)
+					Draw.HorizontalLine(this, "StealthEntry", position.AveragePrice, Brushes.DimGray, DashStyleHelper.Dot, 1);
+				else
+					RemoveDrawObject("StealthEntry");
+			}
+			catch { }
+		}
+
+		private void RemoveStealthLines()
+		{
+			try
+			{
+				RemoveDrawObject("StealthTarget");
+				RemoveDrawObject("StealthStop");
+				RemoveDrawObject("StealthEntry");
+			}
+			catch { }
 		}
 
 		#region Chart Trader Button
@@ -231,6 +407,51 @@ namespace NinjaTrader.NinjaScript.Indicators
 			inputGrid.Children.Add(stopInput);
 
 			buttonStack.Children.Add(inputGrid);
+			// --- Update OCO Button (Top Button) ---
+			if (ShowUpdateOcoButton)
+			{
+				updateOcoButton = new System.Windows.Controls.Button
+				{
+					Content		= "Update OCO",
+					Height		= 25,
+					Margin		= new Thickness(2, 2, 2, 2),
+					Padding		= new Thickness(2, 2, 2, 2),
+					FontSize	= 12,
+					FontWeight	= FontWeights.Bold,
+					HorizontalContentAlignment = HorizontalAlignment.Center,
+					VerticalContentAlignment = VerticalAlignment.Center,
+					Background	= new SolidColorBrush(Color.FromRgb(70, 130, 180)), // Steel Blue
+					Foreground	= Brushes.White,
+					BorderBrush	= new SolidColorBrush(Color.FromRgb(70, 130, 180)),
+					BorderThickness = new Thickness(1),
+					Cursor		= System.Windows.Input.Cursors.Hand,
+					ToolTip		= "Manually update Target and Stop to match input values"
+				};
+				updateOcoButton.MouseEnter += (s, e) => { updateOcoButton.Background = new SolidColorBrush(Color.FromRgb(43, 54, 68)); updateOcoButton.Foreground = new SolidColorBrush(Color.FromRgb(198, 214, 230)); };
+				updateOcoButton.MouseLeave += (s, e) => { updateOcoButton.Background = new SolidColorBrush(Color.FromRgb(70, 130, 180)); updateOcoButton.Foreground = Brushes.White; };
+				updateOcoButton.Click += OnUpdateOcoClicked;
+
+				buttonStack.Children.Add(updateOcoButton);
+			}
+
+			// --- Stealth Toggle Button (2nd Button) ---
+			if (ShowStealthButton)
+			{
+				stealthToggleButton = new System.Windows.Controls.Button
+				{
+					Content		= stealthMode ? "STEALTH MODE ON" : "STEALTH MODE OFF",
+					Height		= 25,
+					Margin		= new Thickness(2, 2, 2, 2),
+					FontSize	= 12,
+					FontWeight	= FontWeights.Bold,
+					Foreground	= Brushes.White,
+					Cursor		= System.Windows.Input.Cursors.Hand,
+					ToolTip		= "Toggle Stealth Mode (orders managed locally, not sent to broker)"
+				};
+				stealthToggleButton.Click += OnStealthToggleClicked;
+				buttonStack.Children.Add(stealthToggleButton);
+			}
+
 			// --- Target Button ---
 			if (ShowTargetButton)
 			{
@@ -287,33 +508,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 				buttonStack.Children.Add(addStopButton);
 			}
 
-			// --- Add OCO Button ---
-			if (ShowAddOcoButton)
-			{
-				addOcoButton = new System.Windows.Controls.Button
-				{
-					Content		= "Add OCO",
-					Height		= 25,
-					Margin		= new Thickness(2, 2, 2, 2),
-					Padding		= new Thickness(2, 2, 2, 2),
-					FontSize	= 12,
-					FontWeight	= FontWeights.Bold,
-					HorizontalContentAlignment = HorizontalAlignment.Center,
-					VerticalContentAlignment = VerticalAlignment.Center,
-					Background	= new SolidColorBrush(Color.FromRgb(112, 128, 144)), // Slate Grey
-					Foreground	= Brushes.White,
-					BorderBrush	= new SolidColorBrush(Color.FromRgb(112, 128, 144)),
-					BorderThickness = new Thickness(1),
-					Cursor		= System.Windows.Input.Cursors.Hand,
-					ToolTip		= "Place both Target and Stop as an OCO pair"
-				};
-				addOcoButton.MouseEnter += (s, e) => { addOcoButton.Background = new SolidColorBrush(Color.FromRgb(43, 54, 68)); addOcoButton.Foreground = new SolidColorBrush(Color.FromRgb(198, 214, 230)); };
-				addOcoButton.MouseLeave += (s, e) => { addOcoButton.Background = new SolidColorBrush(Color.FromRgb(112, 128, 144)); addOcoButton.Foreground = Brushes.White; };
-				addOcoButton.Click += OnAddOcoClicked;
-
-				buttonStack.Children.Add(addOcoButton);
-			}
-			
 			// --- Auto Toggle Buttons ---
 			autoTargetToggleButton = new System.Windows.Controls.Button
 			{
@@ -355,6 +549,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 			System.Windows.Controls.Grid.SetColumnSpan(buttonStack, chartTraderGrid.ColumnDefinitions.Count > 0 ? chartTraderGrid.ColumnDefinitions.Count : 1);
 			chartTraderGrid.Children.Add(buttonStack);
 
+			Account newAcct = GetSelectedAccount();
+			if (newAcct != null)
+			{
+				if (newAcct.Name != lastAccountName)
+					SwitchActiveAccount(newAcct);
+				tradingAccount = newAcct;
+			}
+
 			isButtonAdded = true;
 			Print("TradeTargetManager: Buttons added to Chart Trader.");
 		}
@@ -364,9 +566,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (!isButtonAdded || chartTraderGrid == null)
 				return;
 
+			if (updateOcoButton != null) updateOcoButton.Click -= OnUpdateOcoClicked;
+			if (stealthToggleButton != null) stealthToggleButton.Click -= OnStealthToggleClicked;
 			if (addTargetButton != null) addTargetButton.Click -= OnAddTargetClicked;
 			if (addStopButton != null) addStopButton.Click -= OnAddStopClicked;
-			if (addOcoButton != null) addOcoButton.Click -= OnAddOcoClicked;
+			if (autoTargetToggleButton != null) autoTargetToggleButton.Click -= OnAutoTargetToggleClicked;
 			if (autoStopToggleButton != null) autoStopToggleButton.Click -= OnAutoStopToggleClicked;
 			if (targetInput != null) 
 			{ 
@@ -440,6 +644,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 					autoStopToggleButton.BorderBrush = autoStopToggleButton.Background;
 					autoStopToggleButton.Content = AutoAddStop ? "Auto Stop ON" : "Auto Stop OFF";
 				}
+
+				if (stealthToggleButton != null)
+				{
+					stealthToggleButton.Background = stealthMode ? new SolidColorBrush(Color.FromRgb(255, 140, 0)) : new SolidColorBrush(Color.FromRgb(105, 105, 105)); // Dark Orange for Stealth
+					stealthToggleButton.BorderBrush = stealthToggleButton.Background;
+					stealthToggleButton.Content = stealthMode ? "STEALTH MODE ON" : "STEALTH MODE OFF";
+				}
 			}));
 		}
 
@@ -498,41 +709,49 @@ namespace NinjaTrader.NinjaScript.Indicators
 			// Run tracking and triggering logic
 			ChartControl.Dispatcher.InvokeAsync(new Action(() =>
 			{
-				if (!AutoAddTarget && !AutoAddStop) return;
-
 				Account selectedAcct = GetSelectedAccount();
 				if (selectedAcct == null || acctName != selectedAcct.Name)
 					return;
 
+				if (selectedAcct.Name != lastAccountName)
+					SwitchActiveAccount(selectedAcct);
 				tradingAccount = selectedAcct;
 
-				double lastQty = 0;
-				MarketPosition lastPos = MarketPosition.Flat;
-				lock (stateLock)
+				AccountTradeState state = GetAccountState(acctName);
+				bool isChanged = (currentQty != state.LastPositionQuantity || currentMarketPos != state.LastMarketPosition);
+				bool isNotFlat = currentMarketPos != MarketPosition.Flat && currentQty > 0;
+				bool isIncrease = currentQty > state.LastPositionQuantity || (state.LastMarketPosition == MarketPosition.Flat && isNotFlat);
+
+				if (!isNotFlat)
 				{
-					if (accountLastQuantities.ContainsKey(acctName))
-						lastQty = accountLastQuantities[acctName];
-					if (accountLastPositions.ContainsKey(acctName))
-						lastPos = accountLastPositions[acctName];
+					state.StealthTargetPrice = 0;
+					state.StealthStopPrice = 0;
+					state.ActiveTargetOrderId = null;
+					state.ActiveStopOrderId = null;
+					stealthTargetPrice = 0;
+					stealthStopPrice = 0;
+					RemoveDrawObject("StealthTarget");
+					RemoveDrawObject("StealthStop");
+					RemoveDrawObject("StealthEntry");
 				}
 
-				bool isChanged = (currentQty != lastQty || currentMarketPos != lastPos);
-				bool isNotFlat = currentMarketPos != MarketPosition.Flat;
-				bool isIncrease = currentQty > lastQty || (lastPos == MarketPosition.Flat && isNotFlat);
+				state.LastPositionQuantity = currentQty;
+				state.LastMarketPosition = currentMarketPos;
+				lastPositionQuantity = currentQty;
+				lastMarketPosition = currentMarketPos;
+
+				lock (stateLock)
+				{
+					accountLastQuantities[acctName] = currentQty;
+					accountLastPositions[acctName] = currentMarketPos;
+				}
+
+				if (!AutoAddTarget && !AutoAddStop) return;
 
 				if (isNotFlat && isChanged && isIncrease)
 				{
 					Print(string.Format("TradeTargetManager: Position size increased on {2} ({0} -> {1}). Waiting 1s for settlement...", 
-						lastQty, currentQty, acctName));
-					
-					// Update tracking state immediately to prevent double-triggering
-					lock (stateLock)
-					{
-						accountLastQuantities[acctName] = currentQty;
-						accountLastPositions[acctName] = currentMarketPos;
-					}
-					lastPositionQuantity = currentQty;
-					lastMarketPosition = currentMarketPos;
+						state.LastPositionQuantity, currentQty, acctName));
 
 					// Perform the delay in a background task, then dispatch the order placement to the UI thread
 					System.Threading.Tasks.Task.Run(async () =>
@@ -547,17 +766,20 @@ namespace NinjaTrader.NinjaScript.Indicators
 							{
 								if (AutoAddTarget && AutoAddStop)
 								{
-									Print(string.Format("TradeTargetManager: Submitting target and stop OCO orders for {0} contracts on {1}.", currentPos.Quantity, tradingAccount.Name));
+									Print(string.Format("TradeTargetManager: Submitting target and stop {0} for {1} contracts on {2}.", 
+										stealthMode ? "STEALTH levels" : "OCO orders", currentPos.Quantity, tradingAccount.Name));
 									ExecuteUpdateOrders(currentPos);
 								}
 								else if (AutoAddTarget)
 								{
-									Print(string.Format("TradeTargetManager: Submitting target order for {0} contracts on {1}.", currentPos.Quantity, tradingAccount.Name));
+									Print(string.Format("TradeTargetManager: Submitting target {0} for {1} contracts on {2}.", 
+										stealthMode ? "STEALTH level" : "order", currentPos.Quantity, tradingAccount.Name));
 									ExecuteAddTarget(currentPos);
 								}
 								else if (AutoAddStop)
 								{
-									Print(string.Format("TradeTargetManager: Submitting stop order for {0} contracts on {1}.", currentPos.Quantity, tradingAccount.Name));
+									Print(string.Format("TradeTargetManager: Submitting stop {0} for {1} contracts on {2}.", 
+										stealthMode ? "STEALTH level" : "order", currentPos.Quantity, tradingAccount.Name));
 									ExecuteAddStopLoss(currentPos);
 								}
 							}
@@ -572,10 +794,21 @@ namespace NinjaTrader.NinjaScript.Indicators
 							Position currentPos = tradingAccount.Positions.FirstOrDefault(p => p.Instrument.FullName == Instrument.FullName);
 							if (currentPos != null && currentPos.MarketPosition != MarketPosition.Flat)
 							{
-								bool hasTarget = tradingAccount.Orders.Any(o => o.Instrument == Instrument && o.Name == "TgtMgr_Target" && 
-									(o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
-								bool hasStop = tradingAccount.Orders.Any(o => o.Instrument == Instrument && o.Name == "TgtMgr_Stop" && 
-									(o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
+								bool hasTarget;
+								bool hasStop;
+
+								if (stealthMode)
+								{
+									hasTarget = stealthTargetPrice > 0;
+									hasStop = stealthStopPrice > 0;
+								}
+								else
+								{
+									hasTarget = tradingAccount.Orders.Any(o => o.Instrument == Instrument && o.Name == "TgtMgr_Target" && 
+										(o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
+									hasStop = tradingAccount.Orders.Any(o => o.Instrument == Instrument && o.Name == "TgtMgr_Stop" && 
+										(o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
+								}
 
 								bool targetNeeded = AutoAddTarget && !hasTarget;
 								bool stopNeeded = AutoAddStop && !hasStop;
@@ -607,25 +840,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				else if (isNotFlat && isChanged && !isIncrease)
 				{
 					Print(string.Format("TradeTargetManager: Position size decreased on {2} ({0} -> {1}). Ignoring reduction.", 
-						lastQty, currentQty, acctName));
-					
-					lock (stateLock)
-					{
-						accountLastQuantities[acctName] = currentQty;
-						accountLastPositions[acctName] = currentMarketPos;
-					}
-					lastPositionQuantity = currentQty;
-					lastMarketPosition = currentMarketPos;
-				}
-				else
-				{
-					lock (stateLock)
-					{
-						accountLastQuantities[acctName] = currentQty;
-						accountLastPositions[acctName] = currentMarketPos;
-					}
-					lastPositionQuantity = currentQty;
-					lastMarketPosition = currentMarketPos;
+						state.LastPositionQuantity, currentQty, acctName));
 				}
 			}));
 		}
@@ -769,29 +984,120 @@ namespace NinjaTrader.NinjaScript.Indicators
 			Print("TradeTargetManager: Auto Add Stop is now " + (AutoAddStop ? "ON" : "OFF"));
 		}
 
+		private void OnStealthToggleClicked(object sender, RoutedEventArgs e)
+		{
+			StealthMode = !StealthMode;
+			Print("TradeTargetManager: Stealth Mode is now " + (StealthMode ? "ON" : "OFF"));
+			if (StealthMode)
+			{
+				CancelExistingOrders();
+				Position pos = GetPosition();
+				if (pos != null && pos.MarketPosition != MarketPosition.Flat)
+					UpdateActiveOrdersForPosition(pos);
+			}
+			else
+			{
+				stealthTargetPrice = 0;
+				stealthStopPrice = 0;
+				RemoveDrawObject("StealthTarget");
+				RemoveDrawObject("StealthStop");
+				RemoveDrawObject("StealthEntry");
+				SaveActiveAccountState();
+				Position pos = GetPosition();
+				if (pos != null && pos.MarketPosition != MarketPosition.Flat)
+					UpdateActiveOrdersForPosition(pos);
+			}
+		}
+
+		private void UpdateActiveOrdersForPosition(Position pos)
+		{
+			if (pos == null || pos.MarketPosition == MarketPosition.Flat) return;
+
+			if (AutoAddTarget && AutoAddStop)
+				ExecuteUpdateOrders(pos);
+			else if (AutoAddTarget)
+				ExecuteAddTarget(pos);
+			else if (AutoAddStop)
+				ExecuteAddStopLoss(pos);
+			else
+				ExecuteUpdateOrders(pos);
+		}
+
+		private void SwitchActiveAccount(Account newAccount)
+		{
+			if (newAccount == null) return;
+			
+			string newAccountName = newAccount.Name;
+			if (newAccountName == lastAccountName) return;
+
+			// Save the state of the old account
+			SaveActiveAccountState();
+
+			// Load the state of the new account
+			AccountTradeState newState = GetAccountState(newAccountName);
+			
+			lastAccountName = newAccountName;
+			lastPositionQuantity = newState.LastPositionQuantity;
+			lastMarketPosition = newState.LastMarketPosition;
+			stealthTargetPrice = newState.StealthTargetPrice;
+			stealthStopPrice = newState.StealthStopPrice;
+			activeTargetOrderId = newState.ActiveTargetOrderId;
+			activeStopOrderId = newState.ActiveStopOrderId;
+
+			Print(string.Format("TradeTargetManager: Account switched from {0} to {1}. Loaded state: Qty={2}, Pos={3}, StealthTgt={4}, StealthStop={5}", 
+				lastAccountName ?? "(none)", newAccountName, lastPositionQuantity, lastMarketPosition, stealthTargetPrice, stealthStopPrice));
+
+			// Clear old account's lines; CheckStealthLevels redraws the new account's levels on the next tick
+			stealthExitPending = false;
+			RemoveStealthLines();
+		}
+
 		private void OnAddTargetClicked(object sender, RoutedEventArgs e) { ExecuteAddTarget(); }
 		private void OnAddStopClicked(object sender, RoutedEventArgs e) { ExecuteAddStopLoss(); }
-		private void OnAddOcoClicked(object sender, RoutedEventArgs e) { ExecuteUpdateOrders(GetSelectedPosition()); }
+		private void OnUpdateOcoClicked(object sender, RoutedEventArgs e) { ExecuteUpdateOrders(GetSelectedPosition()); }
+		private void OnAddOcoClicked(object sender, RoutedEventArgs e) { OnUpdateOcoClicked(sender, e); }
+
+		private Position GetPosition()
+		{
+			if (tradingAccount == null) return null;
+			lock (tradingAccount.Positions)
+			{
+				return tradingAccount.Positions.FirstOrDefault(p => p.Instrument.FullName == Instrument.FullName);
+			}
+		}
+
 		private Position GetSelectedPosition()
 		{
 			tradingAccount = GetSelectedAccount();
-			if (tradingAccount == null) return null;
-			return tradingAccount.Positions.FirstOrDefault(p => p.Instrument.FullName == Instrument.FullName);
+			return GetPosition();
 		}
 
 		private void ExecuteUpdateOrders(Position position)
 		{
-			if (isExecuting || tradingAccount == null) return;
-			if (position == null || position.MarketPosition == MarketPosition.Flat)
-			{
-				Print("TradeTargetManager: No open position to update.");
-				return;
-			}
-
+			if (isExecuting) return;
 			isExecuting = true;
 
 			try
 			{
+				if (tradingAccount == null)
+					tradingAccount = GetSelectedAccount();
+
+				if (position == null || position.MarketPosition == MarketPosition.Flat || position.Quantity == 0)
+				{
+					CancelExistingOrders();
+					stealthTargetPrice = 0;
+					stealthStopPrice = 0;
+					activeTargetOrderId = null;
+					activeStopOrderId = null;
+					activeTargetOrder = null;
+					activeStopOrder = null;
+					RemoveDrawObject("StealthTarget");
+					RemoveDrawObject("StealthStop");
+					RemoveDrawObject("StealthEntry");
+					SaveActiveAccountState();
+					Print("TradeTargetManager: Position is flat or not found. Existing orders/stealth levels cleared.");
+					return;
+				}
 				double entryPrice = position.AveragePrice;
 				int quantity = (int)position.Quantity;
 				MarketPosition direction = position.MarketPosition;
@@ -817,25 +1123,57 @@ namespace NinjaTrader.NinjaScript.Indicators
 				// Cancel existing
 				CancelExistingOrders();
 
-				// Submit new ones as OCO
-				string ocoId = string.Format("TgtMgr_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
+				if (stealthMode)
+				{
+					stealthTargetPrice = targetPrice;
+					stealthStopPrice = stopPrice;
+					activeTargetOrderId = null;
+					activeStopOrderId = null;
+					activeTargetOrder = null;
+					activeStopOrder = null;
 
-				Order targetOrder = tradingAccount.CreateOrder(
-					Instrument, exitAction, OrderType.Limit, OrderEntry.Manual, TimeInForce.Gtc, quantity,
-					targetPrice, 0, ocoId, "TgtMgr_Target", Core.Globals.MaxDate, null
-				);
+					stealthExitPending = false;
+					// Lines are drawn by CheckStealthLevels on the next tick (instrument thread)
 
-				Order stopOrder = tradingAccount.CreateOrder(
-					Instrument, exitAction, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Gtc, quantity,
-					0, stopPrice, ocoId, "TgtMgr_Stop", Core.Globals.MaxDate, null
-				);
+					SaveActiveAccountState();
 
-				tradingAccount.Submit(new[] { targetOrder, stopOrder });
-				
-				activeTargetOrder = targetOrder;
-				activeTargetOrderId = targetOrder.OrderId;
-				activeStopOrder = stopOrder;
-				activeStopOrderId = stopOrder.OrderId;
+					Print(string.Format("TradeTargetManager: STEALTH Orders Updated -> Target: {0}, Stop: {1} (Qty: {2})", 
+						targetPrice, stopPrice, quantity));
+				}
+				else
+				{
+					stealthTargetPrice = 0;
+					stealthStopPrice = 0;
+					RemoveDrawObject("StealthTarget");
+					RemoveDrawObject("StealthStop");
+					RemoveDrawObject("StealthEntry");
+
+					// Submit new ones as OCO
+					string ocoId = string.Format("TgtMgr_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
+
+					Order targetOrder = tradingAccount.CreateOrder(
+						Instrument, exitAction, OrderType.Limit, OrderEntry.Manual, TimeInForce.Gtc, quantity,
+						targetPrice, 0, ocoId, "TgtMgr_Target", Core.Globals.MaxDate, null
+					);
+
+					Order stopOrder = tradingAccount.CreateOrder(
+						Instrument, exitAction, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Gtc, quantity,
+						0, stopPrice, ocoId, "TgtMgr_Stop", Core.Globals.MaxDate, null
+					);
+
+					tradingAccount.Submit(new[] { targetOrder, stopOrder });
+					
+					activeTargetOrder = targetOrder;
+					activeTargetOrderId = targetOrder.OrderId;
+					activeStopOrder = stopOrder;
+					activeStopOrderId = stopOrder.OrderId;
+
+					SaveActiveAccountState();
+
+					Print(string.Format("TradeTargetManager: Updated Orders -> Target: {0}, Stop: {1} (Qty: {2}, OCO: {3})", 
+						targetPrice, stopPrice, quantity, ocoId));
+				}
+
 				lock (stateLock)
 				{
 					accountLastQuantities[tradingAccount.Name] = quantity;
@@ -843,9 +1181,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 				}
 				lastPositionQuantity = quantity;
 				lastMarketPosition = direction;
-
-				Print(string.Format("TradeTargetManager: Updated Orders -> Target: {0}, Stop: {1} (Qty: {2}, OCO: {3})", 
-					targetPrice, stopPrice, quantity, ocoId));
 			}
 			catch (Exception ex) { Print("TradeTargetManager ERROR: " + ex.Message); }
 			finally { isExecuting = false; }
@@ -926,22 +1261,50 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				CancelExistingTarget();
 
-				tradingAccount.OrderUpdate -= OnAccountOrderUpdate;
-				tradingAccount.OrderUpdate += OnAccountOrderUpdate;
+				if (stealthMode)
+				{
+					stealthTargetPrice = targetPrice;
+					activeTargetOrder = null;
+					activeTargetOrderId = null;
 
-				// Use provided OCO ID or generate a new unique one
-				string finalOco = ocoId;
-				if (string.IsNullOrEmpty(finalOco))
-					finalOco = string.Format("TgtMgr_Tgt_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
+					stealthExitPending = false;
+					// Lines are drawn by CheckStealthLevels on the next tick (instrument thread)
 
-				Order targetOrder = tradingAccount.CreateOrder(
-					Instrument, exitAction, OrderType.Limit, OrderEntry.Manual, TimeInForce.Gtc, quantity,
-					targetPrice, 0, finalOco, "TgtMgr_Target", Core.Globals.MaxDate, null
-				);
+					SaveActiveAccountState();
 
-				tradingAccount.Submit(new[] { targetOrder });
-				activeTargetOrder	= targetOrder;
-				activeTargetOrderId	= targetOrder.OrderId;
+					Print(string.Format("TradeTargetManager: STEALTH Target Updated -> Target: {0} (Qty: {1})", 
+						targetPrice, quantity));
+				}
+				else
+				{
+					stealthTargetPrice = 0;
+					RemoveDrawObject("StealthTarget");
+					if (stealthStopPrice <= 0)
+						RemoveDrawObject("StealthEntry");
+
+					tradingAccount.OrderUpdate -= OnAccountOrderUpdate;
+					tradingAccount.OrderUpdate += OnAccountOrderUpdate;
+
+					// Use provided OCO ID or generate a new unique one
+					string finalOco = ocoId;
+					if (string.IsNullOrEmpty(finalOco))
+						finalOco = string.Format("TgtMgr_Tgt_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
+
+					Order targetOrder = tradingAccount.CreateOrder(
+						Instrument, exitAction, OrderType.Limit, OrderEntry.Manual, TimeInForce.Gtc, quantity,
+						targetPrice, 0, finalOco, "TgtMgr_Target", Core.Globals.MaxDate, null
+					);
+
+					tradingAccount.Submit(new[] { targetOrder });
+					activeTargetOrder	= targetOrder;
+					activeTargetOrderId	= targetOrder.OrderId;
+
+					SaveActiveAccountState();
+
+					Print(string.Format("TradeTargetManager: Target order submitted for {0} @ {1} (Account: {2}, OCO: {3})", 
+						quantity, targetPrice, tradingAccount.Name, finalOco));
+				}
+
 				lock (stateLock)
 				{
 					accountLastQuantities[tradingAccount.Name] = quantity;
@@ -949,9 +1312,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 				}
 				lastPositionQuantity = quantity;
 				lastMarketPosition = direction;
-
-				Print(string.Format("TradeTargetManager: Target order submitted for {0} @ {1} (Account: {2}, OCO: {3})", 
-					quantity, targetPrice, tradingAccount.Name, finalOco));
 			}
 			catch (Exception ex) { Print("TradeTargetManager ERROR: " + ex.Message); }
 			finally { isExecuting = false; }
@@ -1014,22 +1374,50 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				CancelExistingStop();
 
-				tradingAccount.OrderUpdate -= OnAccountOrderUpdate;
-				tradingAccount.OrderUpdate += OnAccountOrderUpdate;
+				if (stealthMode)
+				{
+					stealthStopPrice = stopPrice;
+					activeStopOrder = null;
+					activeStopOrderId = null;
 
-				// Use provided OCO ID or generate a new unique one
-				string finalOco = ocoId;
-				if (string.IsNullOrEmpty(finalOco))
-					finalOco = string.Format("TgtMgr_Stop_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
+					stealthExitPending = false;
+					// Lines are drawn by CheckStealthLevels on the next tick (instrument thread)
 
-				Order stopOrder = tradingAccount.CreateOrder(
-					Instrument, exitAction, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Gtc, quantity,
-					0, stopPrice, finalOco, "TgtMgr_Stop", Core.Globals.MaxDate, null
-				);
+					SaveActiveAccountState();
 
-				tradingAccount.Submit(new[] { stopOrder });
-				activeStopOrder		= stopOrder;
-				activeStopOrderId	= stopOrder.OrderId;
+					Print(string.Format("TradeTargetManager: STEALTH Stop Updated -> Stop: {0} (Qty: {1})", 
+						stopPrice, quantity));
+				}
+				else
+				{
+					stealthStopPrice = 0;
+					RemoveDrawObject("StealthStop");
+					if (stealthTargetPrice <= 0)
+						RemoveDrawObject("StealthEntry");
+
+					tradingAccount.OrderUpdate -= OnAccountOrderUpdate;
+					tradingAccount.OrderUpdate += OnAccountOrderUpdate;
+
+					// Use provided OCO ID or generate a new unique one
+					string finalOco = ocoId;
+					if (string.IsNullOrEmpty(finalOco))
+						finalOco = string.Format("TgtMgr_Stop_{0}_{1}", Instrument.FullName.Replace(" ", ""), DateTime.Now.Ticks);
+
+					Order stopOrder = tradingAccount.CreateOrder(
+						Instrument, exitAction, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Gtc, quantity,
+						0, stopPrice, finalOco, "TgtMgr_Stop", Core.Globals.MaxDate, null
+					);
+
+					tradingAccount.Submit(new[] { stopOrder });
+					activeStopOrder		= stopOrder;
+					activeStopOrderId	= stopOrder.OrderId;
+
+					SaveActiveAccountState();
+
+					Print(string.Format("TradeTargetManager: Stop loss submitted for {0} @ {1} (Account: {2}, OCO: {3})", 
+						quantity, stopPrice, tradingAccount.Name, finalOco));
+				}
+
 				lock (stateLock)
 				{
 					accountLastQuantities[tradingAccount.Name] = quantity;
@@ -1037,9 +1425,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 				}
 				lastPositionQuantity = quantity;
 				lastMarketPosition = direction;
-
-				Print(string.Format("TradeTargetManager: Stop loss submitted for {0} @ {1} (Account: {2}, OCO: {3})", 
-					quantity, stopPrice, tradingAccount.Name, finalOco));
 			}
 			catch (Exception ex) { Print("TradeTargetManager ERROR: " + ex.Message); }
 			finally { isExecuting = false; }
@@ -1164,6 +1549,19 @@ namespace NinjaTrader.NinjaScript.Indicators
 			} 
 		}
 
+		[NinjaScriptProperty]
+		[Display(Name = "Stealth Mode", GroupName = "Parameters", Order = 3)]
+		public bool StealthMode 
+		{ 
+			get { return stealthMode; } 
+			set 
+			{ 
+				stealthMode = value; 
+				if (ChartControl != null)
+					ChartControl.Dispatcher.InvokeAsync(new Action(() => UpdateToggleButtonStyles()));
+			} 
+		}
+
 		[Browsable(false)]
 		public bool AutoAddTarget
 		{
@@ -1187,16 +1585,27 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 
 		[NinjaScriptProperty]
-		[Display(Name = "Show Target Button", Order = 1, GroupName = "UI Settings")]
+		[Display(Name = "Show Update OCO Button", Order = 1, GroupName = "UI Settings")]
+		public bool ShowUpdateOcoButton { get; set; }
+
+		[Browsable(false)]
+		public bool ShowAddOcoButton
+		{
+			get { return ShowUpdateOcoButton; }
+			set { ShowUpdateOcoButton = value; }
+		}
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show Stealth Button", Order = 2, GroupName = "UI Settings")]
+		public bool ShowStealthButton { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show Target Button", Order = 3, GroupName = "UI Settings")]
 		public bool ShowTargetButton { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Show Stop Button", Order = 2, GroupName = "UI Settings")]
+		[Display(Name = "Show Stop Button", Order = 4, GroupName = "UI Settings")]
 		public bool ShowStopButton { get; set; }
-
-		[NinjaScriptProperty]
-		[Display(Name = "Show Add OCO Button", Order = 3, GroupName = "UI Settings")]
-		public bool ShowAddOcoButton { get; set; }
 		#endregion
 	}
 }
